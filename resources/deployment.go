@@ -8,6 +8,23 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
+func MutateDeployment(app *appv1beta1.AppService, deploy *appsv1.Deployment) {
+	labels := map[string]string{"app": app.Name}
+	selector := &metav1.LabelSelector{MatchLabels: labels}
+	deploy.Spec = appsv1.DeploymentSpec{
+		Replicas: app.Spec.Size,
+		Template: corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: labels,
+			},
+			Spec: corev1.PodSpec{
+				Containers: newContainers(app),
+			},
+		},
+		Selector: selector,
+	}
+}
+
 func NewDeploy(app *appv1beta1.AppService) *appsv1.Deployment {
 	labels := map[string]string{"app": app.Name}
 	selector := &metav1.LabelSelector{MatchLabels: labels}

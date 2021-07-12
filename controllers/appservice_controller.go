@@ -18,17 +18,15 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"github.com/blueskyxi3/opdemo/v2/resources"
+	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/util/json"
-	"reflect"
-
-	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	appv1beta1 "github.com/blueskyxi3/opdemo/v2/api/v1beta1"
 )
@@ -44,10 +42,13 @@ type AppServiceReconciler struct {
 	Scheme *runtime.Scheme
 }
 
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=app.ydzs.io,resources=appservices,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=app.ydzs.io,resources=appservices/status,verbs=get;update;patch
 
 func (r *AppServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
+	fmt.Println("start to Reconcile.......")
 	ctx := context.Background()
 	log := r.Log.WithValues("appservice", req.NamespacedName)
 
@@ -56,7 +57,7 @@ func (r *AppServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) 
 	var appService appv1beta1.AppService
 	err := r.Get(ctx, req.NamespacedName, &appService)
 	if err != nil {
-		// MyApp 被删除的时候，忽略
+		// AppService 被删除的时候，忽略
 		if client.IgnoreNotFound(err) != nil {
 			return ctrl.Result{}, err
 		}
@@ -65,81 +66,48 @@ func (r *AppServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) 
 
 	log.Info("fetch appservice objects", "appservice", appService)
 
-	// 如果不存在，则创建关联资源
-	// 如果存在，判断是否需要更新
-	//   如果需要更新，则直接更新
-	//   如果不需要更新，则正常返回
-	deploy := &appsv1.Deployment{}
-	if err := r.Get(ctx, req.NamespacedName, deploy); err != nil && errors.IsNotFound(err) {
-		// 1. 关联 Annotations
-		data, _ := json.Marshal(appService.Spec)
-		if appService.Annotations != nil {
-			appService.Annotations[oldSpecAnnotation] = string(data)
-		} else {
-			appService.Annotations = map[string]string{oldSpecAnnotation: string(data)}
-		}
-		if err := r.Client.Update(ctx, &appService); err != nil {
-			return ctrl.Result{}, err
-		}
-		// 创建关联资源
-		// 2. 创建 Deployment
-		deploy := resources.NewDeploy(&appService)
-		if err := r.Client.Create(ctx, deploy); err != nil {
-			return ctrl.Result{}, err
-		}
-		// 3. 创建 Service
-		service := resources.NewService(&appService)
-		if err := r.Create(ctx, service); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
-	}
-	oldspec := appv1beta1.AppServiceSpec{}
-	if err := json.Unmarshal([]byte(appService.Annotations[oldSpecAnnotation]), &oldspec); err != nil {
+	// 得到AppService过后去创建对应的Deployment和Service
+	// CreateOrUpdate Deployment
+	// (就是观察的当前状态和期望的状态进行对比)
+
+	// 调谐，获取到当前的一个状态，然后和我们期望的状态进行对比
+	// CreateOrUpdate Deployment
+	var deploy appsv1.Deployment
+	deploy.Name = appService.Name
+	deploy.Namespace = appService.Namespace
+	or, err := ctrl.CreateOrUpdate(ctx, r, &deploy, func() error {
+		fmt.Println("CreateOrUpdate Deployment!")
+		// 调谐必需在这个函数中去实现
+		resources.MutateDeployment(&appService, &deploy)
+		return controllerutil.SetControllerReference(&appService, &deploy, r.Scheme)
+	})
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-	// 当前规范与旧的对象不一致，则需要更新
-	if !reflect.DeepEqual(appService.Spec, oldspec) {
-		// 更新关联资源
-		newDeploy := resources.NewDeploy(&appService)
-		oldDeploy := &appsv1.Deployment{}
-		if err := r.Get(ctx, req.NamespacedName, oldDeploy); err != nil {
-			return ctrl.Result{}, err
-		}
-		oldDeploy.Spec = newDeploy.Spec
-		//注意，生产上一般情况下不会直接调用Update去更新，因为其它controller可能也在watch这个资源,这样可能会导致
-		//版本不一致而更新出错，这样我们就需要retry
-		//if retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		//	if err := r.Client.Update(ctx, oldDeploy); err != nil {
-		//		return  err
-		//	}
-		//	return nil
-		//}); err != nil{
-		//	return ctrl.Result{}, err
-		//}
+	log.Info("CreateOrUpdate", "Deployment", or)
 
-		if err := r.Client.Update(ctx, oldDeploy); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		newService := resources.NewService(&appService)
-		oldService := &corev1.Service{}
-		if err := r.Get(ctx, req.NamespacedName, oldService); err != nil {
-			return ctrl.Result{}, err
-		}
-		// 需要指定 ClusterIP 为之前的，不然更新会报错
-		newService.Spec.ClusterIP = oldService.Spec.ClusterIP
-		oldService.Spec = newService.Spec
-		if err := r.Client.Update(ctx, oldService); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
+	// CreateOrUpdate Deployment
+	var svc corev1.Service
+	svc.Name = appService.Name
+	svc.Namespace = appService.Namespace
+	or, err = ctrl.CreateOrUpdate(ctx, r, &svc, func() error {
+		fmt.Println("CreateOrUpdate Service!")
+		// 调谐必需在这个函数中去实现
+		resources.MutateService(&appService, &svc)
+		return controllerutil.SetControllerReference(&appService, &svc, r.Scheme)
+	})
+	if err != nil {
+		return ctrl.Result{}, err
 	}
+	log.Info("CreateOrUpdate", "Service", or)
+
 	return ctrl.Result{}, nil
 }
 
 func (r *AppServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appv1beta1.AppService{}).
+		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Service{}).
 		Complete(r)
 }
